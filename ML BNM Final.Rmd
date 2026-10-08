@@ -1,0 +1,655 @@
+---
+title: "ML Forecast Final"
+author: "Tee Wei Hern"
+date: "2025-08-13"
+output: html_document
+---
+
+```{r}
+library(readxl) # read xlsx file
+library(openxlsx) # export xlsx file
+library(glmnet) # lasso
+library(tidyverse)
+library(caret) # random forest
+library(ggplot2)
+library(forecast) # arima/random walk
+library(zoo) # as.yearqtr()
+```
+
+# Cleaning data
+```{r}
+inflation_data_raw <- read_excel("N:July 2025 Inflation Data.xlsx")
+```
+
+```{r}
+inflation_data <- inflation_data_raw %>%
+  select(!c(headline : supercore10)) %>%
+  select(!c(petrol95 : ...51)) %>%
+  select(!c(...54 : ...70, "Paste ygap here", "Half rule")) %>%
+  rename(date = ...1) %>%
+  rename(er = er...18)
+
+inflation_data$winf <- as.numeric(inflation_data$winf)
+inflation_data$neer <- as.numeric(inflation_data$neer)
+inflation_data$comm <- as.numeric(inflation_data$comm)
+inflation_data$er <- as.numeric(inflation_data$er)
+inflation_data$ygap <- as.numeric(inflation_data$ygap)
+inflation_data$wage <- as.numeric(inflation_data$wage)
+inflation_data$prod <- as.numeric(inflation_data$prod)
+
+# transforming data to qoq
+inflation_data <- inflation_data %>%
+  mutate(core_qoq = 100 * (log(inflation_data$core) - log(lag(inflation_data$core))),
+         winf_qoq = 100 * (log(inflation_data$winf) - log(lag(inflation_data$winf))),
+         neer_qoq = 100 * (log(inflation_data$neer) - log(lag(inflation_data$neer))),
+         comm_qoq = 100 * (log(inflation_data$comm) - log(lag(inflation_data$comm))),
+         er_qoq = 100 * (log(inflation_data$er) - log(lag(inflation_data$er))),
+         wage_qoq = 100 * (log(inflation_data$wage) - log(lag(inflation_data$wage))),
+         prod_qoq = 100 * (log(inflation_data$prod) - log(lag(inflation_data$prod))))
+
+# adding lagged variables
+inflation_data <- inflation_data %>%
+  mutate(core_lag1 = lag(core_qoq, 1),
+         core_lag4 = lag(core_qoq, 4),
+         winf_lag1 = lag(winf_qoq, 1),
+         winf_lag4 = lag(winf_qoq, 4),
+         neer_lag1 = lag(neer_qoq, 1),
+         neer_lag4 = lag(neer_qoq, 4),
+         comm_lag1 = lag(comm_qoq, 1),
+         comm_lag4 = lag(comm_qoq, 4),
+         er_lag1 = lag(er_qoq, 1),
+         er_lag4 = lag(er_qoq, 4),
+         ygap_lag1 = lag(ygap_qoq, 1),
+         ygap_lag4 = lag(ygap_qoq, 4),
+         wage_lag1 = lag(wage_qoq, 1),
+         wage_lag4 = lag(wage_qoq, 4),
+         prod_lag1 = lag(prod_qoq, 1),
+         prod_lag4 = lag(prod_qoq, 4))
+```
+```{r}
+inflation_data <- inflation_data %>%
+  slice(-c(145:154))
+```
+```{r}
+# split training and testing set following chronological order
+inf_train <- inflation_data %>%
+  slice(c(1:132))
+
+inf_test <- inflation_data %>%
+  slice(c(133:137))
+
+inf_forecast <- inflation_data %>%
+  slice(c(137:144))
+```
+
+# 1 Random Forest
+```{r}
+# Remove NA values
+inf_train <- inflation_data %>% drop_na()
+
+# Parameter tuning
+rf_grid <- expand.grid(mtry = c(3, 5, 7, 9), min.node.size = c(10, 15, 20), splitrule = "variance")
+
+# Train parameters, using time series cross validation (TSCV) for data that has temporal order
+set.seed(1)
+fit_Control <- trainControl(method = "timeslice",
+                            initialWindow = 80, # size of initial training
+                            horizon = 1, # forecast horizon
+                            fixedWindow = TRUE, # training set shifts each iteration(rolling origin)
+                            summaryFunction = defaultSummary)
+
+set.seed(1)
+RF_model <- train(core_qoq ~ winf_qoq + neer_qoq + comm_qoq + er_qoq + ygap + wage_qoq + prod_qoq + core_lag1 + core_lag4 + winf_lag1 + winf_lag4 + neer_lag1 + neer_lag4 + comm_lag1 + comm_lag4 + er_lag1 + er_lag4 + ygap_lag1 + ygap_lag4 + wage_lag1 + wage_lag4 + prod_lag1 + prod_lag4 + q1 + q2 + q3 + q4, 
+                  data = inf_train,
+                  method = "ranger",
+                  trControl = fit_Control,
+                  tuneGrid = rf_grid,
+                  num.trees = 300,
+                  importance = 'permutation')
+
+# Check variable importance for each predictor
+varImp(RF_model)
+
+print(RF_model$results %>% arrange(RMSE))
+```
+```{r}
+# visualize resampling results
+ggplot(RF_model, metric = "RMSE")
+```
+```{r}
+fitControl_final <- trainControl(method = "none")
+RF_final <- train(core_qoq ~ winf_qoq + neer_qoq + comm_qoq + er_qoq + ygap + wage_qoq + prod_qoq + core_lag1 + core_lag4 + winf_lag1 + winf_lag4 + neer_lag1 + neer_lag4 + comm_lag1 + comm_lag4 + er_lag1 + er_lag4 + ygap_lag1 + ygap_lag4 + wage_lag1 + wage_lag4 + prod_lag1 + prod_lag4 + q1 + q2 + q3 + q4,
+                  data = inf_train,
+                  method = "ranger",
+                  trControl = fitControl_final,
+                  tuneGrid = data.frame(mtry = 7, min.node.size = 15, splitrule = "variance"), num.trees = 300, importance = 'permutation')
+
+varImp(RF_final)
+```
+```{r}
+# Perform prediction
+RF_predict_train <- predict(RF_final, newdata = inf_train)
+RF_predict_test <- predict(RF_final, newdata = inf_test)
+```
+```{r}
+# Creating line plot
+results <- data.frame(
+  Date = inf_train$date,
+  Actual = inf_train$core_qoq,
+  Predicted = RF_predict_train)
+
+ggplot(results, aes(x = Date)) +
+  geom_line(aes(y = Actual, color = "Actual")) +
+  geom_line(aes(y = Predicted, color = "Predicted")) +
+  labs(title = "Actual vs Predicted Core Inflation (Random Forest)",
+       y = "Core Inflation(%)", x = "Date", color = "Legend") +
+  theme_minimal()
+
+rmse <- sqrt(mean((inf_train$core_qoq - RF_predict_train)^2))
+print(rmse)
+```
+```{r}
+# Repeat with testing data
+results_RF <- data.frame(
+  Date = inf_test$date,
+  Actual = inf_test$core_qoq,
+  Predicted = RF_predict_test)
+
+ggplot(results_RF, aes(x = Date)) +
+  geom_line(aes(y = Actual, color = "Actual")) +
+  geom_line(aes(y = Predicted, color = "Predicted")) +
+  geom_line(aes(y = Actual, color = "Actual"), size = 3) +
+  geom_line(aes(y = Predicted, color = "Predicted"), size = 3) +
+  labs(title = "Actual vs Predicted Core Inflation (Random Forest)",
+       y = "Core Inflation (%)", x = "Date", color = "Legend") +
+  theme_minimal()
+
+rmse <- sqrt(mean((inf_test$core_qoq - RF_predict_test)^2))
+print(rmse)
+```
+
+```{r}
+# Creating rolling window forecast 2025Q2 - 2026Q4
+forecast_core_qoq_RF <- function(model, data) {
+  n <- nrow(data)
+  
+  # Store forecasts
+  forecasts <- rep(NA, n)
+  
+  # Loop through each row
+  for (i in 1:n) {
+    # Only forecast if core_qoq is NA
+    if (is.na(data$core_qoq[i])) {
+      
+      # Prepare predictors for this row
+      predictors <- data[i, ] %>%
+        select(winf_qoq, neer_qoq, comm_qoq, er_qoq, ygap, wage_qoq, prod_qoq, winf_lag1, winf_lag4, neer_lag1, neer_lag4, comm_lag1, comm_lag4, er_lag1, er_lag4, ygap_lag1, ygap_lag4, wage_lag1, wage_lag4, prod_lag1, prod_lag4, core_lag1, core_lag4, q1, q2, q3, q4)
+      
+      # Convert to matrix for LASSO/RF
+      X <- as.matrix(predictors)
+      
+      # Forecast using model
+      forecast <- predict(model, newdata = X)
+      
+      # Save forecast
+      data$core_qoq[i] <- forecasts
+      forecasts[i] <- forecast
+      
+      # Update lagged values in future rows
+      if (i + 1 <= n) {
+        data$core_lag1[i + 1] <- forecast
+      }
+      if (i + 4 <= n) {
+        data$core_lag4[i + 4] <- forecast
+      }
+    }
+  }
+  return(list(updated_data = data, forecasts = forecasts))
+}
+
+forecast_core_qoq_RF(RF_final, inf_forecast)
+```
+```{r}
+results_forecast_RF <- data.frame(Date = inf_forecast$date,
+                                  Predicted = forecast_core_qoq_RF(RF_final, inf_forecast)$forecasts)
+```
+
+# 2 LASSO
+```{r}
+# Remove NA values
+inf_train <- inf_train %>% drop_na()
+
+y_train <- inf_train$core_qoq
+X_train <- as.matrix(inf_train %>%
+                       select(winf_qoq, neer_qoq, comm_qoq, er_qoq, ygap, wage_qoq, prod_qoq, winf_lag1, winf_lag4, neer_lag1, neer_lag4, comm_lag1, comm_lag4, er_lag1, er_lag4, ygap_lag1, ygap_lag4, wage_lag1, wage_lag4, prod_lag1, prod_lag4, core_lag1, core_lag4, q1, q2, q3, q4))
+
+y_test <- inf_test$core_qoq
+X_test <- as.matrix(inf_test %>%
+                       select(winf_qoq, neer_qoq, comm_qoq, er_qoq, ygap, wage_qoq, prod_qoq, winf_lag1, winf_lag4, neer_lag1, neer_lag4, comm_lag1, comm_lag4, er_lag1, er_lag4, ygap_lag1, ygap_lag4, wage_lag1, wage_lag4, prod_lag1, prod_lag4, core_lag1, core_lag4, q1, q2, q3, q4))
+
+# Scaling training and testing set(already scaled since qoq)
+X_scaled_train <- X_train
+X_scaled_test <- X_test
+
+# Perform time series CV, along with testing best alpha, best lambda, and best horizon
+tscv_glmnet_alpha_search <- function(X, y, alpha_seq = seq(0, 1, by = 0.1), 
+                                     lambda_seq = 10^seq(-4, 1, length.out = 100),
+                                     initial_window = 80, 
+                                     horizon) {
+  n_obs <- nrow(X)
+  n_folds <- n_obs - initial_window
+  results <- data.frame(alpha = numeric(), lambda = numeric(), rmse = numeric())
+  
+  for (alpha_val in alpha_seq) {
+    rmse_per_lambda <- numeric(length(lambda_seq))
+    
+    for(j in seq_along(lambda_seq)) {
+      lambda <- lambda_seq[j]
+      preds <- c()
+      actuals <- c()
+      
+      for(i in 1:(n_folds - horizon + 1)) {
+        idx_train <- 1:(initial_window + i - 1)
+        idx_val <- (initial_window + i):(initial_window + i + horizon - 1)
+        
+        X_t <- X[idx_train, ]
+        y_t <- y[idx_train]
+        X_val <- X[idx_val, , drop = FALSE]
+        y_val <- y[idx_val]
+        
+        model <- glmnet(X_t, y_t, alpha = alpha_val, lambda = lambda)
+        pred <- predict(model, newx = X_val)
+        
+        preds <- c(preds, pred)
+        actuals <- c(actuals, y_val)
+      }
+      rmse_per_lambda[j] <- sqrt(mean((actuals - preds)^2))
+    }
+    best_lambda <- lambda_seq[which.min(rmse_per_lambda)]
+    best_rmse <- min(rmse_per_lambda)
+    
+    results <- rbind(results, data.frame(alpha = alpha_val, lambda = best_lambda, rmse = best_rmse))
+  }
+  
+  best_result <- results[which.min(results$rmse), ]
+  return(list(best_alpha = best_result$alpha,
+              best_lambda = best_result$lambda,
+              best_rmse = best_result$rmse,
+              all_results = results))
+}
+
+# Testing over horizons of 1, 4 (quarterly, annually)
+horizons <- c(1, 4)
+results_by_horizon <- list()
+
+for (h in horizons) {
+  result <- tscv_glmnet_alpha_search(X_scaled_train, y_train, horizon = h)
+  results_by_horizon[[paste0("horizon_", h)]] <- result
+  print(results_by_horizon[[paste0("horizon_", h)]])
+}
+
+# Extract RMSE from each horizon result
+rmse_values <- sapply(results_by_horizon, function(res) res$best_rmse)
+
+# Identify the best horizon
+best_horizon_name <- names(rmse_values)[which.min(rmse_values)]
+best_result <- results_by_horizon[[best_horizon_name]]
+
+# Print the best results
+cat("Best Horizon:", best_horizon_name, "\n")
+cat("Best Alpha:", best_result$best_alpha, "\n")
+cat("Best Lambda:", best_result$best_lambda, "\n")
+cat("Best RMSE:", best_result$best_rmse, "\n")
+```
+
+```{r}
+# Train final model on entire training set with best lambda
+final_model <- glmnet(X_scaled_train, y_train, alpha = result$best_alpha, lambda = result$best_lambda)
+
+# Predict on training and testing set
+y_pred_train <- predict(final_model, newx = X_scaled_train)
+y_pred_test <- predict(final_model, newx = X_scaled_test)
+rmse_train <- sqrt(mean((y_train - y_pred_train)^2))
+rmse_test <- sqrt(mean((y_test - y_pred_test)^2))
+print(rmse_train)
+print(rmse_test)
+```
+```{r}
+results <- data.frame(
+  Date = inf_train$date,
+  Actual = y_train,
+  Predicted = as.numeric(y_pred_train))
+
+results <- na.omit(results)
+
+ggplot(results, aes(x = Date)) +
+  geom_line(aes(y = Actual, color = "Actual")) +
+  geom_line(aes(y = Predicted, color = "Predicted")) +
+  labs(title = "LASSO: Actual vs Predicted Core Inflation",
+       y = "Core Inflation (%)", color = "", x = "Date") +
+  theme_minimal()
+
+rmse_train
+```
+```{r}
+results <- data.frame(
+  Date = inf_test$date,
+  Actual = y_test,
+  Predicted = as.numeric(y_pred_test))
+
+results <- na.omit(results)
+
+ggplot(results, aes(x = Date)) +
+  geom_point(aes(y = Actual, color = "Actual"), size = 3) +
+  geom_point(aes(y = Predicted, color = "Predicted"), size = 3) +
+  geom_line(aes(y = Actual, color = "Actual")) +
+  geom_line(aes(y = Predicted, color = "Predicted")) +
+  labs(title = "LASSO: Actual vs Predicted Core Inflation",
+       y = "Core Inflation (%)", color = "", x = "Date") +
+  theme_minimal()
+
+rmse_test
+```
+
+```{r}
+# Plotting graph of RMSE against alpha value
+ggplot(results$all_results, aes(x = alpha, y = rmse)) +
+  geom_point(color = "blue", size = 2) +
+  geom_line(color = "blue", linewidth = 1) +
+  labs(title = "RMSE vs Alpha (glmnet TSCV)",
+       x = "Alpha (0 = Ridge, 1 = LASSO)",
+       y = "RMSE") +
+  theme_minimal()
+```
+```{r}
+# Extract coefficients from the final model
+coef(final_model)
+```
+
+```{r}
+# Creating rolling window forecast 2025Q2 - 2026Q4
+forecast_core_qoq_lasso <- function(model, data) {
+  n <- nrow(data)
+  
+  # Store forecasts
+  forecasts <- rep(NA, n)
+  
+  # Loop through each row
+  for (i in 1:n) {
+    # Only forecast if core_qoq is NA
+    if (is.na(data$core_qoq[i])) {
+      
+      # Prepare predictors for this row
+      predictors <- data[i, ] %>%
+        select(winf_qoq, neer_qoq, comm_qoq, er_qoq, ygap, wage_qoq, prod_qoq, winf_lag1, winf_lag4, neer_lag1, neer_lag4, comm_lag1, comm_lag4, er_lag1, er_lag4, ygap_lag1, ygap_lag4, wage_lag1, wage_lag4, prod_lag1, prod_lag4, core_lag1, core_lag4, q1, q2, q3, q4)
+      
+      # Convert to matrix for LASSO
+      X <- as.matrix(predictors)
+      
+      # Forecast using model
+      forecast <- predict(model, newx = X)
+      
+      # Save forecast
+      data$core_qoq[i] <- forecasts
+      forecasts[i] <- forecast
+      
+      # Update lagged values in future rows
+      if (i + 1 <= n) {
+        data$core_lag1[i + 1] <- forecast
+      }
+      if (i + 4 <= n) {
+        data$core_lag4[i + 4] <- forecast
+      }
+    }
+  }
+  return(list(updated_data = data, forecasts = forecasts))
+}
+
+forecast_core_qoq_lasso(final_model, inf_forecast)
+```
+```{r}
+results_forecast_lasso <- data.frame(Date = inf_forecast$date,
+                                  Predicted = forecast_core_qoq_lasso(final_model, inf_forecast)$forecasts)
+```
+
+# 3 ARIMA as non-ML baseline
+```{r}
+# converting data to time series object
+inf_ts <- ts(inflation_data$core_qoq, start = c(1991, 1), frequency = 4)  # quarterly
+train <- window(inf_ts, end = c(2023,4))
+test <- window(inf_ts, start = c(2024, 1))
+```
+```{r}
+# fit ARIMA model
+arima_model <- auto.arima(train)
+summary(arima_model)
+```
+```{r}
+# forecast future values
+n_test <- length(test)
+forecast_arima <- forecast(arima_model, h = 5) # make consistent with testing window
+plot(forecast_arima)
+lines(test, col = "red")
+
+accuracy(forecast_arima, test)
+```
+
+# 4 Compare predictions by backtesting (with NKPC)
+```{r}
+results_test <- data.frame(
+  Date = inf_test$date,
+  Actual = inf_test$core_qoq,
+  LASSO = as.numeric(y_pred_test),
+  RF = RF_predict_test,
+  ARIMA = as.numeric(forecast_arima$mean))
+
+library(ggplot2)
+ggplot(results_test, aes(x = Date)) +
+  geom_line(aes(y = Actual, color = "Actual")) +
+  geom_line(aes(y = LASSO, color = "LASSO")) +
+  geom_line(aes(y = RF, color = "Random Forest")) +
+  geom_line(aes(y = ARIMA, color = "ARIMA"))
+
+# Converting qoq inflation to yoy 
+results_train <- data.frame(
+  Date = inf_train$date,
+  Actual = y_train,
+  LASSO = as.numeric(y_pred_train),
+  RF = RF_predict_train,
+  ARIMA = inf_train$core_qoq) # training same as actual
+
+results_join <- bind_rows(results_train, results_test)
+
+# To get qoq values from 2023 to transform into yoy in 2024
+results_join <- results_join %>%
+  slice_tail(n = 9)
+```
+
+```{r}
+# Export results_join to excel to perform function externally (qoq to yoy)
+library(openxlsx)
+
+# Only run this once, if data is already written to excel, skip this step
+# Create this data on a separate tab / excel
+wb <- loadWorkbook("copy file path here")
+writeData(wb, sheet = "Sheet 2 (Example)", x = results_join, startCol = 1, startRow = 1)
+saveWorkbook(wb, "copy file path here", overwrite = TRUE)
+```
+
+```{r}
+# Import data from the excel above after performing function to transform yoy
+inf_yoy_raw <- read_excel("copy file path here", sheet = "Sheet 2 (Example)")
+
+# Update this according to testing period, or just use inf_yoy_raw$date
+yoy <- c("2024Q1", "2024Q2", "2024Q3", "2024Q4", "2025Q1")
+
+inf_yoy <- inf_yoy_raw %>%
+  select(c(inf_yoy_actual: inf_yoy_ARIMA)) %>% # data here transformed to yoy
+  drop_na()
+
+# Importing NKPC info
+NKPC_2023 <- read_excel("path to NKPC values 2023", sheet = "Sheet 2 (Example)")
+NKPC_2024 <- read_excel("path to NKPC values 2024", sheet = "Sheet 2 (Example)")
+NKPC_2025 <- read_excel("path to NKPC values 2025", sheet = "Sheet 2 (Example)")
+
+# slice NKPC to back-testing period
+NKPC_2024 <- NKPC_2024 %>%
+  slice_head(n = 5)
+```
+```{r}
+inf_yoy <- data.frame(Period_yoy = yoy, # or get from inf_yoy_raw$date
+                      Actual = inf_yoy$inf_yoy_actual,
+                      LASSO = inf_yoy$inf_yoy_lasso,
+                      RF = inf_yoy$inf_yoy_RF,
+                      ARIMA = inf_yoy$inf_yoy_ARIMA,
+                      NKPC = NKPC_2024$F_NKPC)
+
+print(inf_yoy)
+```
+```{r}
+ggplot(inf_yoy, aes(x = Period_yoy)) +
+  geom_point(aes(y = Actual, color = "Actual"), size = 3) +
+  geom_point(aes(y = LASSO, color = "LASSO"), size = 3) +
+  geom_point(aes(y = RF, color = "RF"), size = 3) +
+  geom_point(aes(y = ARIMA, color = "ARIMA"), size = 3) +
+  geom_point(aes(y = NKPC, color = "NKPC"), size = 3) +
+  
+  geom_line(aes(y = Actual, color = "Actual"), group = 1) +
+  geom_line(aes(y = LASSO, color = "LASSO"), group = 1) +
+  geom_line(aes(y = RF, color = "RF"), group = 1) +
+  geom_line(aes(y = ARIMA, color = "ARIMA"), group = 1) +
+  geom_line(aes(y = NKPC, color = "NKPC"), group = 1) +
+  labs(title = "Inflation Forecast = Actual vs Predicted Core Inflation",
+       y = "Core Inflation", color = "", x = "Period") +
+  theme_minimal()
+
+# bar graph yoy (remove ARIMA to compare only ML and NKPC)
+inf_yoy_long <- inf_yoy %>%
+  pivot_longer(cols = c("Actual", "LASSO", "RF", "NKPC"), 
+               names_to = "Type", 
+               values_to = "Inflation")
+
+inf_yoy_long$Type <- factor(inf_yoy_long$Type, levels = c("Actual", "LASSO", "RF", "NKPC"))
+
+ggplot(inf_yoy_long, aes(x = Period_yoy, y = Inflation, fill = Type)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(aes(label = sprintf("%.2f", Inflation)),
+            position = position_dodge(width = 0.9),
+            vjust = 1.5) +
+  labs(title = "Annual Actual vs Predicted Core Inflation",
+       x = "Year", y = "Annual Core Inflation (%)", fill = "") +
+  theme_minimal()
+```
+```{r}
+# Calculating RMSE
+sqdiff <- inf_yoy_raw %>% # squared difference calculated from excel as well
+  select(c(sqdiff_lasso : sqdiff_ARIMA)) %>%
+  drop_na()
+
+NKPC_2024_sq_diff <- NKPC_2024 %>%
+  select(F_NKPC) %>%
+  transmute(sqdiff_NKPC = (F_NKPC - inf_yoy$Actual)^2)
+
+sqdiff_all <- cbind(sqdiff, NKPC_2024_sqdiff)
+
+RMSE_2024 <- sqdiff_all %>%
+  slice_head(n = 4) %>%
+  summarise(RMSE_lasso = sqrt(mean(sqdiff_lasso)),
+            RMSE_RF = sqrt(mean(sqdiff_RF)),
+            RMSE_ARIMA = sqrt(mean(sqdiff_ARIMA)),
+            RMSE_NKPC = sqrt(mean(sqdiff_NKPC)))
+
+print(RMSE_2024)
+```
+
+# 5 Forecasting ahead 2025Q2 to 2026Q
+```{r}
+# Import excel file which contains forecasted values
+inf_yoy_forecast <- read_excel("Copy file path here")
+inf_forecast_final <- inf_yoy_forecast %>%
+  select(c(Date, inf_yoy_lasso : inf_yoy_ARIMA)) %>%
+  slice_tail(n = 7)
+
+NKPC_2025_cut <- NKPC_2025 %>%
+  select(F_NKPC) %>%
+  slice_tail(n = 7)
+
+inf_forecast_final_NKPC <- cbind(inf_forecast_final, NKPC_2025_cut)
+
+print(inf_forecast_final_NKPC)
+```
+```{r}
+# plotting graph of forecast
+yoy <- c("2025Q2", "2025Q3", "2025Q4", "2026Q1", "2026Q2", "2026Q3", "2026Q4")
+inf_forecsat_final_NKPC$Period_yoy <- yoy # add new column
+
+ggplot(inf_forecast_final_NKPC, aes(x = Period_yoy)) +
+  geom_point(aes(y = inf_yoy_lasso, color = "LASSO"), size = 3) +
+  geom_point(aes(y = inf_yoy_RF, color = "RF"), size = 3) +
+  geom_point(aes(y = inf_yoy_ARIMA, color = "ARIMA"), size = 3) +
+  geom_point(aes(y = F_NKPC, color = "F_NKPC"), size = 3) +
+  geom_line(aes(y = inf_yoy_lasso, color = "LASSO"), group = 1) +
+  geom_line(aes(y = inf_yoy_RF, color = "RF"), group = 1) +
+  geom_line(aes(y = inf_yoy_ARIMA, color = "ARIMA"), group = 1) +
+  geom_line(aes(y = F_NKPC, color = "F_NKPC"), group = 1) +
+  labs(title - "Inflation Forecast 2025Q2 to 2026Q4",
+       y = "Core Inflation (%)", color = "", x = "Period") +
+  theme_minimal()
+
+#bar graph
+inf_forecast_final_NKPC_bar <- inf_forecast_final_NKPC %>%
+  select(!c(inf_yoy_ARIMA)) %>%
+  rename(LASSO = inf_yoy_lasso,
+         RF = inf_yoy_RF,
+         NKPC = F_NKPC)
+
+inf_yoy_forecast_long <- inf_forecast_final_NKPC_bar %>%
+  pivot_longer(cols = c("LASSO", "RF", "NKPC"),
+               names_to = "Type", values_to = "Inflation")
+
+inf_yoy_forecast_long$Type <- factor(inf_yoy_forecast_long$Type, levels = c("LASSO", "RF", "NKPC"))
+
+ggplot(inf_yoy_forecast_long, aes(x = Period_yoy, y = Inflation, fill = Type)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(aes(label = sprintf("%.2f", Inflation)),
+            position = position_dodge(width = 0.9),
+            vjust = 1.5) +
+  labs(title = "Core Inflation Forecast",
+       x = "Year", y = "Annual Core Inflation (%)", fill = "") +
+  theme_minimal()
+```
+**Thing to consider: model is trained with log diff qoq. yoy calculation is marginally larger than log diff yoy (adding 4 quarters of log diff qoq), but difference is largely negligible.**
+**Moving ahead: including other features not in NKPC to see if it is an important determinant in predicting inflation (KLCI, card spending etc); can attempt to automate code even further.**
+
+# Guide to import updated dataset to train ML models
+## Disclaimer: Other than the lines stated later below, there may be occasions where changes have to be done on other lines to standardize imported data sets, hence cleaning data is very important.
+
+Note: Ensure all names are consistent in order for code to run successfully; relevant data cleaning has to be done every time an file(excel) is imported to ensure consistency
+
+Line 21 - Import updated data set. (Core sheet)
+
+Line 24 to 68 - Clean data as needed, convert all determinants to log diff qoq (or can do in excel), then add lags to variables.
+
+Line 69 to 73 - Slice data appropriately for training, can just move one row down if data set is updated quarterly.
+
+## Run random forest and LASSO codes ("#1 and #2")
+
+## 3 ARIMA
+Line 419 to 420 - Update period for training and testing window
+
+## 4 Compare predictions by backtesting (with NKPC)
+Note: Many of this part may be optional as they are mostly codes to visualize results, but the crucial part is transforming qoq inflation to yoy. This is done by exporting the model predicted values to excel to transform qoq to yoy.
+
+Line 472 to 476 - Export qoq predictions to excel 
+
+Line 481 - Import data set that has already been transformed to yoy
+Note: sqdiff (squared difference) between predicted and actual values are also calculated in excel in separate columns.
+
+Line 491 to 493 - Import NKPC data from excel
+
+Line 479 to 507 - Clean all imported data appropriately to obtain desired inf_yoy table containing values of date, actual inflation, and forecast from all models. inf_yoy is also used for creating line and bar graphs (if needed)
+
+## 5 Forecasting ahead 2025Q2 to 2026Q
+Line 568 to 571 - Process similar to ##4, but imported data set has forecast values from 2025Q2 to 2026Q4 as well
+
+Line 566 to 580 - Clean data so that only forecast values remain from 2025Q2 to 2026Q4
