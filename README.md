@@ -62,8 +62,8 @@ library(zoo)        # Time series utility functions
 
 ## Guide to Updating & Running the Script
 
-1. **Dataset Import:** Update Excel file paths in Line 21 (`July 2025 Inflation Data.xlsx`)[cite: 1].
-2. **Data Slicing:** Adjust dataset slice indices (Lines 69–73) to accommodate newly added quarterly data[cite: 1].
-3. **Train & Test Windows:** Update training/testing window parameters for ARIMA (Lines 419–420)[cite: 1].
-4. **QoQ to YoY Transformation:** Export predicted results to Excel to calculate YoY transformations and squared differences, or load transformed values back into R (Lines 472–493)[cite: 1].
-5. **Out-of-Sample Forecasts:** Update forecast target Excel sources to view predictions up to 2026Q4 (Line 568)[cite: 1].
+1. **Dataset Import:** Update Excel file paths in Line 21 (`July 2025 Inflation Data.xlsx`).
+2. **Data Slicing:** Adjust dataset slice indices (Lines 69–73) to accommodate newly added quarterly data.
+3. **Train & Test Windows:** Update training/testing window parameters for ARIMA (Lines 419–420).
+4. **QoQ to YoY Transformation:** Export predicted results to Excel to calculate YoY transformations and squared differences, or load transformed values back into R (Lines 472–493).
+5. **Out-of-Sample Forecasts:** Update forecast target Excel sources to view predictions up to 2026Q4 (Line 568).
