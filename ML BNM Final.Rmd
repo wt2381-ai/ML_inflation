@@ -2,7 +2,7 @@
 title: "ML Forecast Final"
 author: "Tee Wei Hern"
 date: "2025-08-13"
-output: html_document
+output: github_document
 ---
 
 ```{r}
